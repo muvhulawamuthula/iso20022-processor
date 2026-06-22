@@ -17,7 +17,10 @@ management:
   endpoints:
     web:
       exposure:
-        include: health, info, metrics
+        include: health, info, metrics, prometheus
+  metrics:
+    tags:
+      application: iso20022-processor
 
 server:
   port: 8080
@@ -25,3 +28,7 @@ server:
 logging:
   level:
     com.muvhulawa.payments: INFO
+  # Carry the pacs.008 MsgId on every log line for that message via MDC, so a single payment
+  # can be traced end to end across the pipeline.
+  pattern:
+    console: "%d{HH:mm:ss.SSS} %-5level [msgId=%X{msgId:-}] %logger{36} - %msg%n"

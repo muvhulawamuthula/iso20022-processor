@@ -6,6 +6,10 @@ import com.muvhulawa.payments.domain.validation.PaymentValidator;
 import com.muvhulawa.payments.idempotency.IdempotencyService;
 import com.muvhulawa.payments.idempotency.ProcessedMessage;
 import com.muvhulawa.payments.messaging.*;
+import com.muvhulawa.payments.observability.PaymentMetrics;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 
@@ -38,25 +42,30 @@ import java.util.Optional;
 @Service
 public class PaymentProcessingService {
 
+    private static final Logger log = LoggerFactory.getLogger(PaymentProcessingService.class);
+
     private final SchemaValidator schemaValidator;
     private final Pacs008Parser parser;
     private final PaymentValidator paymentValidator;
     private final IdempotencyService idempotencyService;
     private final PaymentSettlementService settlementService;
     private final Pacs002Generator pacs002Generator;
+    private final PaymentMetrics metrics;
 
     public PaymentProcessingService(SchemaValidator schemaValidator,
                                     Pacs008Parser parser,
                                     PaymentValidator paymentValidator,
                                     IdempotencyService idempotencyService,
                                     PaymentSettlementService settlementService,
-                                    Pacs002Generator pacs002Generator) {
+                                    Pacs002Generator pacs002Generator,
+                                    PaymentMetrics metrics) {
         this.schemaValidator = schemaValidator;
         this.parser = parser;
         this.paymentValidator = paymentValidator;
         this.idempotencyService = idempotencyService;
         this.settlementService = settlementService;
         this.pacs002Generator = pacs002Generator;
+        this.metrics = metrics;
     }
 
     public ProcessingOutcome process(String pacs008Xml) {
@@ -64,37 +73,53 @@ public class PaymentProcessingService {
         try {
             schemaValidator.validate(pacs008Xml);
         } catch (SchemaInvalidException e) {
+            log.warn("Rejected schema-invalid message (FF01): {}", e.getMessage());
+            metrics.batchProcessed(TransactionStatus.RJCT);
             return ProcessingOutcome.groupRejected(
                     pacs002Generator.generateSchemaReject(ReasonCode.FF01));
         }
 
         // 2. Parse to the clean domain model.
         PaymentBatch batch = parser.parse(pacs008Xml);
-
-        // 3. Idempotency: have we already answered this MsgId?
-        Optional<ProcessedMessage> existing = idempotencyService.findExisting(batch.messageId());
-        if (existing.isPresent()) {
-            return replayOf(existing.get());
-        }
-
-        // 4. Business validation, per transaction. Each transfer is accepted or rejected on its own.
-        List<TransactionOutcome> outcomes = new ArrayList<>(batch.numberOfTransactions());
-        List<CreditTransfer> toSettle = new ArrayList<>();
-        for (CreditTransfer transfer : batch.transactions()) {
-            Optional<BusinessRuleViolation> violation = paymentValidator.validate(transfer);
-            if (violation.isPresent()) {
-                BusinessRuleViolation v = violation.get();
-                outcomes.add(TransactionOutcome.rejected(transfer, v.reasonCode(), v.narrative()));
-            } else {
-                outcomes.add(TransactionOutcome.accepted(transfer));
-                toSettle.add(transfer);
+        MDC.put("msgId", batch.messageId());
+        try {
+            // 3. Idempotency: have we already answered this MsgId?
+            Optional<ProcessedMessage> existing = idempotencyService.findExisting(batch.messageId());
+            if (existing.isPresent()) {
+                log.info("Duplicate delivery — replaying stored response");
+                metrics.batchReplayed();
+                return replayOf(existing.get());
             }
-        }
 
-        // 5 + 6. Derive the group status, render the pacs.002, then settle atomically.
-        TransactionStatus groupStatus = ProcessingOutcome.groupStatusOf(outcomes);
-        String pacs002Xml = pacs002Generator.generate(pacs008Xml, groupStatus, outcomes);
-        return commitOrReplay(batch, toSettle, groupStatus, outcomes, pacs002Xml);
+            // 4. Business validation, per transaction. Each transfer is judged on its own.
+            List<TransactionOutcome> outcomes = new ArrayList<>(batch.numberOfTransactions());
+            List<CreditTransfer> toSettle = new ArrayList<>();
+            for (CreditTransfer transfer : batch.transactions()) {
+                Optional<BusinessRuleViolation> violation = paymentValidator.validate(transfer);
+                TransactionOutcome outcome;
+                if (violation.isPresent()) {
+                    BusinessRuleViolation v = violation.get();
+                    outcome = TransactionOutcome.rejected(transfer, v.reasonCode(), v.narrative());
+                } else {
+                    outcome = TransactionOutcome.accepted(transfer);
+                    toSettle.add(transfer);
+                }
+                outcomes.add(outcome);
+                metrics.transactionProcessed(outcome);
+            }
+
+            // 5 + 6. Derive the group status, render the pacs.002, then settle atomically.
+            TransactionStatus groupStatus = ProcessingOutcome.groupStatusOf(outcomes);
+            String pacs002Xml = pacs002Generator.generate(pacs008Xml, groupStatus, outcomes);
+            ProcessingOutcome result =
+                    commitOrReplay(batch, toSettle, groupStatus, outcomes, pacs002Xml);
+            log.info("Processed batch of {} transaction(s): group status {}{}",
+                    batch.numberOfTransactions(), result.groupStatus(),
+                    result.duplicateReplay() ? " (replay)" : "");
+            return result;
+        } finally {
+            MDC.remove("msgId");
+        }
     }
 
     /**
@@ -105,9 +130,14 @@ public class PaymentProcessingService {
                                              TransactionStatus groupStatus,
                                              List<TransactionOutcome> outcomes, String pacs002Xml) {
         try {
-            settlementService.settleBatch(batch, toSettle, groupStatus, pacs002Xml);
+            metrics.recordSettlement(() ->
+                    settlementService.settleBatch(batch, toSettle, groupStatus, pacs002Xml));
+            metrics.batchProcessed(groupStatus);
             return new ProcessingOutcome(groupStatus, outcomes, pacs002Xml, false);
         } catch (DataIntegrityViolationException raceLost) {
+            // A concurrent duplicate won the unique-constraint race; serve its stored response.
+            log.info("Lost idempotency race — replaying the winner's stored response");
+            metrics.batchReplayed();
             return idempotencyService.findExisting(batch.messageId())
                     .map(this::replayOf)
                     .orElseThrow(() -> raceLost);

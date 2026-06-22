@@ -2,6 +2,7 @@ package com.muvhulawa.payments;
 
 import com.muvhulawa.payments.domain.ledger.LedgerRepository;
 import com.muvhulawa.payments.idempotency.ProcessedMessageRepository;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -37,6 +38,7 @@ class PaymentApiIntegrationTest {
     @Autowired private MockMvc mvc;
     @Autowired private LedgerRepository ledgerRepository;
     @Autowired private ProcessedMessageRepository processedMessageRepository;
+    @Autowired private MeterRegistry meterRegistry;
 
     @BeforeEach
     void cleanSlate() {
@@ -122,6 +124,10 @@ class PaymentApiIntegrationTest {
 
     @Test
     void partialBatchSettlesAcceptedTransfersAndReportsPerTransactionStatus() throws Exception {
+        double partBefore = counter("iso20022.batches.processed", "groupStatus", "PART");
+        double acscBefore = counter("iso20022.transactions.processed", "status", "ACSC", "reason", "NONE");
+        double am02Before = counter("iso20022.transactions.processed", "status", "RJCT", "reason", "AM02");
+
         MvcResult res = submit(sample("partial-batch-pacs008.xml"));
 
         // Group status reflects a mixed batch.
@@ -139,6 +145,19 @@ class PaymentApiIntegrationTest {
         assertEquals(2, ledgerRepository.findByTransactionId("TXB-0001").size());
         assertEquals(0, ledgerRepository.findByTransactionId("TXB-0002").size());
         assertEquals(2, ledgerRepository.findByTransactionId("TXB-0003").size());
+
+        // Business metrics were recorded with the right dimensions (deltas — the registry is
+        // shared across tests in this context).
+        assertEquals(1.0, counter("iso20022.batches.processed", "groupStatus", "PART") - partBefore);
+        assertEquals(2.0, counter("iso20022.transactions.processed", "status", "ACSC", "reason", "NONE") - acscBefore);
+        assertEquals(1.0, counter("iso20022.transactions.processed", "status", "RJCT", "reason", "AM02") - am02Before);
+        assertTrue(meterRegistry.find("iso20022.settlement.duration").timer().count() >= 1);
+    }
+
+    /** Reads a counter's current value, or 0 if it has not been registered yet. */
+    private double counter(String name, String... tags) {
+        var c = meterRegistry.find(name).tags(tags).counter();
+        return c == null ? 0.0 : c.count();
     }
 
     /** Parses the pacs.002 and maps OrgnlTxId -> TxSts, namespace-agnostically. */
