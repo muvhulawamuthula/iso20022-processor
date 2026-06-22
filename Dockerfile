@@ -20,7 +20,8 @@ USER appuser
 COPY --from=build /app/target/iso20022-processor-*.jar app.jar
 
 EXPOSE 8080
+# TCP readiness check using bash (no wget/curl in the base image).
 HEALTHCHECK --interval=30s --timeout=3s --start-period=40s \
-  CMD wget -qO- http://localhost:8080/actuator/health | grep -q UP || exit 1
+  CMD bash -c ':</dev/tcp/localhost/8080' || exit 1
 
 ENTRYPOINT ["java", "-jar", "/app/app.jar"]
