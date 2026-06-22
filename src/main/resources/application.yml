@@ -1,0 +1,27 @@
+spring:
+  application:
+    name: iso20022-processor
+  datasource:
+    url: jdbc:h2:mem:ledger;DB_CLOSE_DELAY=-1
+    username: sa
+    password: ""
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: false
+  h2:
+    console:
+      enabled: true   # http://localhost:8080/h2-console  (JDBC URL: jdbc:h2:mem:ledger)
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, metrics
+
+server:
+  port: 8080
+
+logging:
+  level:
+    com.muvhulawa.payments: INFO
