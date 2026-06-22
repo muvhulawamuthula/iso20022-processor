@@ -4,6 +4,11 @@ A Spring Boot service that ingests, validates, transforms, settles, and acknowle
 **ISO 20022 `pacs.008`** (FI-to-FI Customer Credit Transfer) messages, responding with a
 **`pacs.002`** (FI-to-FI Payment Status Report) on every request.
 
+A `pacs.008` is a **batch**: it carries one or more credit-transfer transactions. Each one is
+validated and settled independently and reported with its own status, so a single message can come
+back **fully accepted (ACSC)**, **fully rejected (RJCT)**, or **partially accepted (PART)** — the
+mix real clearing systems actually produce.
+
 This is the kind of component that sits at the heart of a national payments or interbank
 clearing system. It is deliberately built to demonstrate **payments-engineering judgment** —
 not just "it works", but *why each decision is the safe one when real money moves*.
@@ -31,22 +36,22 @@ not just "it works", but *why each decision is the safe one when real money move
  └─────────────────┘
        │ first time
        ▼
- ┌─────────────────┐   AM02 / AM03 / NARR
- │ 4. Business     │──────────────────────────► pacs.002 RJCT (+ ISO reason code)
- │    validation   │
- └─────────────────┘
-       │ acceptable
-       ▼
- ┌─────────────────┐
- │ 5. Settle       │  → balanced double-entry ledger postings (debit + credit, nets to 0)
- │    (ledger)     │
- └─────────────────┘
+ ┌─────────────────────────────────────────────┐
+ │ 4. Per-transaction business validation       │   each CdtTrfTxInf judged on its own
+ │    (loop over every CdtTrfTxInf)             │──► AM02 / AM03 / NARR per transaction
+ └─────────────────────────────────────────────┘
        │
        ▼
- ┌─────────────────┐
- │ 6. Generate     │  → pacs.002 ACSC  (XSLT transform of the original message)
- │    pacs.002     │
- └─────────────────┘
+ ┌─────────────────────────────────────────────┐
+ │ 5. Settle accepted transfers (ONE txn)       │  → balanced double-entry per transfer;
+ │    + record idempotency key, atomically      │    whole batch commits or rolls back
+ └─────────────────────────────────────────────┘
+       │
+       ▼
+ ┌─────────────────────────────────────────────┐
+ │ 6. Generate pacs.002 (XSLT)                  │  → per-transaction TxSts + a derived
+ │                                              │    group status: ACSC / PART / RJCT
+ └─────────────────────────────────────────────┘
 ```
 
 Spec requirements this single project demonstrates: **XSD validation, XSLT transformation,
@@ -72,20 +77,53 @@ curl -s -X POST http://localhost:8080/api/v1/payments/pacs008 \
 Submit it **again** — same `MsgId` — and you get the *identical* response with
 `X-Idempotent-Replay: true` and **no second ledger posting**.
 
-Other samples that exercise rejection paths:
+Other samples that exercise the rejection and partial-batch paths:
 
 | Sample | Outcome | ISO reason |
 |---|---|---|
 | `valid-pacs008.xml` | ACSC (settled) | — |
+| `partial-batch-pacs008.xml` | **PART** — 2 of 3 settle | `AM02` on the rejected leg |
 | `invalid-amount-pacs008.xml` | RJCT | `AM02` Not allowed amount |
 | `same-party-pacs008.xml` | RJCT | `NARR` Debtor = Creditor |
 | any malformed XML | RJCT | `FF01` Invalid file format |
 
+The partial batch is the interesting one — the returned `pacs.002` carries a `TxSts` per
+transaction (`ACSC`, `RJCT`, `ACSC`) under a group status of `PART`, and the ledger shows only the
+two accepted transfers posted.
+
 Inspect the ledger at `http://localhost:8080/h2-console` (JDBC URL `jdbc:h2:mem:ledger`).
 
 ```bash
-mvn test   # unit tests for business rules + the double-entry invariant
+mvn test   # 16 tests: business rules, the double-entry invariant, full HTTP flow,
+           # partial-batch settlement, idempotency under concurrency, and an XXE attack
 ```
+
+### Run it in Docker
+
+```bash
+docker build -t iso20022-processor .
+docker run -p 8080:8080 iso20022-processor   # runs as a non-root user, with a healthcheck
+```
+
+### Observability
+
+Business outcomes — not just request counts — are exported via Micrometer:
+
+```bash
+curl -s http://localhost:8080/actuator/prometheus | grep iso20022
+```
+
+```
+iso20022_batches_processed_total{groupStatus="PART"}                     1.0
+iso20022_transactions_processed_total{status="ACSC",reason="NONE"}       2.0
+iso20022_transactions_processed_total{status="RJCT",reason="AM02"}       1.0
+iso20022_batches_replayed_total                                          1.0
+iso20022_settlement_duration_seconds{quantile="0.95"}                  ...
+```
+
+The accept/reject mix, which ISO reason codes are firing, the duplicate-replay rate, and
+settlement latency are exactly the signals an operator watches on a clearing component. Every log
+line for a message also carries its `MsgId` (via MDC) so a single payment is traceable end to end.
 
 ---
 
@@ -110,25 +148,40 @@ deliveries race, one loses on the constraint and we return the winner's stored r
 than paying twice. Without this, a redelivered `pacs.008` = a double payment.
 
 **4. Double-entry ledger with an enforced zero-sum invariant.**
-Every settlement writes exactly two postings — a debit and a credit — that must net to zero,
-checked *before* commit. The settlement is one transaction: both legs commit or neither does.
-Money systems fail closed: if the books would go out of balance, the transaction rolls back.
+Every settled transfer writes exactly two postings — a debit and a credit — that must net to zero,
+checked *before* commit. Money systems fail closed: if the books would go out of balance, the
+transaction rolls back.
 
-**5. Compile-once / use-per-call for all XML engines.**
+**5. A batch is the unit of atomicity and idempotency — but the unit of *judgment* is the transaction.**
+Each `CdtTrfTxInf` is validated on its own, so one bad transaction does not sink its siblings: the
+batch comes back `PART` with a per-transaction `TxSts`. But settlement of every accepted transfer
+*plus* recording the `MsgId` happens in **one** transaction — so a redelivered batch can never
+re-post *any* of its legs, and a mid-batch failure rolls the whole thing back. Per-transaction
+verdicts, all-or-nothing commit.
+
+**6. The Java side decides; the XSLT only renders.**
+Per-transaction verdicts can't be expressed as one group-wide stylesheet parameter, so the
+processor computes every transaction's status in Java and hands the XSLT a small verdict node-set
+(resolved in-process via the `document()` function — never fetched). The stylesheet looks each
+transaction up by `TxId` and renders its `TxSts`. The transform stays a pure renderer; the verdict
+logic stays testable Java.
+
+**7. Compile-once / use-per-call for all XML engines.**
 `Schema`, `JAXBContext`, and XSLT `Templates` are immutable, thread-safe, and expensive — built
 once at startup. `Validator`, `Unmarshaller`, and `Transformer` are stateful and **not**
 thread-safe — created per call. Getting this split wrong is a real production footgun: either
 you pay the compile cost on every request, or you corrupt state under load.
 
-**6. XXE hardening on every parser.**
+**8. XXE hardening on every parser — and a test that proves it.**
 Payment ingress is untrusted input. DOCTYPE declarations and external entities are disabled on
-the schema factory, the StAX reader, and the transformer factory. XML-based payment rails are a
-textbook XXE target.
+the schema factory, the StAX reader, and the transformer factory. `XxeHardeningTest` fires a real
+external-entity payload at a local secret and asserts it is rejected and never expands — XML-based
+payment rails are a textbook XXE target.
 
-**7. JAXB model is decoupled from the domain.**
-XML/JAXB types stop at `Pacs008Parser`. Everything downstream works with the plain `Payment`
-record, so the ledger and validation never depend on the wire format. Swapping `pacs.008.001.08`
-for a newer version touches the binding layer only.
+**9. JAXB model is decoupled from the domain.**
+XML/JAXB types stop at `Pacs008Parser`. Everything downstream works with the plain `CreditTransfer`
+/ `PaymentBatch` records, so the ledger and validation never depend on the wire format. Swapping
+`pacs.008.001.08` for a newer version touches the binding layer only.
 
 ---
 
@@ -143,17 +196,19 @@ This is a portfolio-scale build. To run in a real clearing context you would add
 - **IBM MQ ingress** instead of (or alongside) the HTTP endpoint — a JMS listener with a
   dead-letter queue, poison-message handling, and the same idempotent consumer logic. (This is
   the companion "IBM MQ Integration Gateway" project.)
-- **Multi-transaction batches.** A pacs.008 can carry many `CdtTrfTxInf` entries; this build
-  settles the first and is explicit about it. Real ingress iterates every transaction and reports
-  a per-transaction status in the pacs.002.
 - **Real account/balance checks** — `AC04` closed account, insufficient-funds, limit checks.
 - **Persistent idempotency store** (the in-memory H2 table resets on restart) and a retention
-  policy.
-- **Observability** — OpenTelemetry traces per message, queue-depth and reject-rate metrics
-  wired to the Actuator endpoints already enabled here.
+  policy. The Dockerfile and config are ready to point at Postgres.
+- **Distributed tracing** — the metrics and MDC correlation are wired here; OpenTelemetry spans
+  per message across the MQ → settle → acknowledge hops are the next step.
+
+Done already, and often listed as "what's next" elsewhere: **multi-transaction batches with
+per-transaction status**, **partial-batch settlement**, **Prometheus metrics**, **CI**, and a
+**non-root container**.
 
 ---
 
 ## Stack
 
-Java 21 · Spring Boot 3.3 · Spring Data JPA · JAXB (jakarta) · JAXP (XSD + XSLT) · H2 · JUnit 5
+Java 21 · Spring Boot 3.3 · Spring Data JPA · JAXB (jakarta) · JAXP (XSD + XSLT) ·
+Micrometer / Prometheus · H2 · JUnit 5 + MockMvc · Docker · GitHub Actions
