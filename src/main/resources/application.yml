@@ -1,17 +1,10 @@
 spring:
   application:
     name: iso20022-processor
-  datasource:
-    url: jdbc:h2:mem:ledger;DB_CLOSE_DELAY=-1
-    username: sa
-    password: ""
-  jpa:
-    hibernate:
-      ddl-auto: create-drop
-    show-sql: false
-  h2:
-    console:
-      enabled: true   # http://localhost:8080/h2-console  (JDBC URL: jdbc:h2:mem:ledger)
+  profiles:
+    # `local` (H2, in-memory) is the default so `mvn spring-boot:run` and the test suite need no
+    # external services. The container runs with SPRING_PROFILES_ACTIVE=postgres (durable store).
+    default: local
 
 management:
   endpoints:
@@ -24,11 +17,12 @@ management:
 
 server:
   port: 8080
+  shutdown: graceful
 
 logging:
   level:
     com.muvhulawa.payments: INFO
   # Carry the pacs.008 MsgId on every log line for that message via MDC, so a single payment
-  # can be traced end to end across the pipeline.
+  # can be traced end to end across the pipeline. Behind Kong this pairs with X-Correlation-ID.
   pattern:
     console: "%d{HH:mm:ss.SSS} %-5level [msgId=%X{msgId:-}] %logger{36} - %msg%n"

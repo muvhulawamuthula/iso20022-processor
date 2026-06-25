@@ -1,0 +1,70 @@
+# Full runnable stack: a counterparty talks ONLY to Kong; Kong is the single public entry point.
+#
+#   counterparty ──▶ kong :8000 ──▶ app :8080 ──▶ postgres :5432
+#                    (authn, rate-limit,         (durable ledger +
+#                     size cap, correlation)      idempotency store)
+#
+# The app is deliberately NOT published to the host — the settlement engine is never directly
+# reachable. Only Kong (:8000 proxy, :8100 metrics) and Postgres (for inspection) are exposed.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: payments
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: payments
+    volumes:
+      # Named volume → the ledger and idempotency store survive a restart. An in-memory store
+      # would forget answered MsgIds and re-pay duplicates after a bounce.
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payments -d payments"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ports:
+      # Host 5433 → container 5432, so it won't clash with a Postgres already on the host's 5432.
+      # Exposed only so you can inspect the ledger; Kong/app reach it on the internal network.
+      - "5433:5432"
+
+  app:
+    build: .
+    environment:
+      SPRING_PROFILES_ACTIVE: postgres
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: payments
+      DB_USER: payments
+      DB_PASSWORD: payments
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose:
+      - "8080"        # reachable only on the internal network, i.e. only by Kong
+
+  kong:
+    image: kong:3.7
+    environment:
+      KONG_DATABASE: "off"                              # DB-less: config is declarative
+      KONG_DECLARATIVE_CONFIG: /kong/kong.yml
+      KONG_PROXY_LISTEN: "0.0.0.0:8000"
+      KONG_ADMIN_LISTEN: "off"                          # no runtime Admin API in DB-less mode
+      KONG_STATUS_LISTEN: "0.0.0.0:8100"                # /metrics (Prometheus) + /status live here
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+    volumes:
+      - ./kong/kong.yml:/kong/kong.yml:ro
+    depends_on:
+      - app
+    ports:
+      - "8000:8000"   # public proxy — the only way in
+      - "8100:8100"   # Kong status + Prometheus edge metrics
+    healthcheck:
+      test: ["CMD", "kong", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:

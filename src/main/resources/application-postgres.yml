@@ -1,0 +1,21 @@
+# Production profile: durable Postgres store with Flyway-managed schema. The container runs with
+# SPRING_PROFILES_ACTIVE=postgres. All connection details come from the environment (the compose
+# file supplies them); the localhost fallbacks let you run against a local Postgres directly.
+spring:
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:payments}
+    username: ${DB_USER:payments}
+    password: ${DB_PASSWORD:payments}
+  jpa:
+    hibernate:
+      # Flyway owns the schema; Hibernate only validates the entity mappings against it at startup
+      # (and never mutates a production database). This fails fast on any drift between the
+      # migration DDL and the @Entity column mappings.
+      ddl-auto: validate
+    show-sql: false
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+  h2:
+    console:
+      enabled: false
