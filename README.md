@@ -14,6 +14,13 @@ clearing system, with the correctness properties that matter when real money mov
 processing, atomic settlement, a balanced double-entry ledger, and structured ISO status
 responses on every outcome.
 
+<details>
+<summary>📸 Rendered README preview</summary>
+
+![Rendered README rendered on GitHub](docs/readme-rendered.png)
+
+</details>
+
 ---
 
 ## What it does
