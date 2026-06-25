@@ -1,6 +1,8 @@
 package com.muvhulawa.payments.idempotency;
 
 import jakarta.persistence.*;
+import org.hibernate.annotations.JdbcTypeCode;
+import org.hibernate.type.SqlTypes;
 import java.time.Instant;
 
 /**
@@ -28,7 +30,10 @@ public class ProcessedMessage {
     @Column
     private String reasonCode;    // ISO reason code for a RJCT; null for ACSC
 
-    @Lob
+    // Mapped as LONGVARCHAR (-> Postgres `text`, H2 long varchar), not @Lob: @Lob makes the
+    // Postgres dialect expect an `oid` large-object column, which both clashes with the Flyway
+    // `text` DDL under ddl-auto=validate and drags in out-of-line LOB / auto-commit semantics.
+    @JdbcTypeCode(SqlTypes.LONGVARCHAR)
     @Column(nullable = false)
     private String pacs002Xml;    // the response we returned the first time
 
