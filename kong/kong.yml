@@ -1,0 +1,68 @@
+# Kong DB-less declarative config — the entire gateway, version-controlled. No Kong database, no
+# Admin API: this file IS the configuration. Reload by restarting the kong container.
+#
+# Edge policy enforced in front of the payment engine:
+#   key-auth               every submission must present a counterparty API key
+#   rate-limiting          60 requests / minute, budgeted PER counterparty
+#   request-size-limiting  512 KB cap on the XML body, rejected at the edge
+#   correlation-id         stamps X-Correlation-ID (pairs with the app's MsgId MDC trace)
+#   prometheus             edge metrics on :8100/metrics, alongside the app's business metrics
+_format_version: "3.0"
+
+services:
+  - name: iso20022-app
+    url: http://app:8080
+    routes:
+      - name: pacs008-submit
+        paths:
+          - /api/v1/payments
+        methods:
+          - POST
+        strip_path: false   # forward the full /api/v1/payments/pacs008 path to the app unchanged
+    plugins:
+      # A clearing endpoint never accepts anonymous submissions. Each counterparty bank is a Kong
+      # consumer identified by its key; that identity also drives per-consumer rate limits + metrics.
+      - name: key-auth
+        config:
+          key_names:
+            - apikey
+          hide_credentials: true   # strip the key before proxying upstream — the app never sees it
+
+      # Protect the settlement engine (XSD + JAXB + XSLT + a DB transaction per request) from a
+      # misbehaving or redelivering counterparty. Budgeted per consumer, so one bank can't starve
+      # the others. `local` counters suit a single gateway node; use `redis` for a Kong cluster.
+      - name: rate-limiting
+        config:
+          minute: 60
+          policy: local
+          limit_by: consumer
+
+      # Payment messages are small; reject an oversized body at the edge before the app buffers it.
+      # Defense in depth alongside the app's XXE hardening.
+      - name: request-size-limiting
+        config:
+          allowed_payload_size: 512
+          size_unit: kilobytes
+
+      # A gateway-assigned request id, distinct from the business MsgId. Echoed back to the caller
+      # and forwarded upstream, so a single payment is traceable edge-to-ledger.
+      - name: correlation-id
+        config:
+          header_name: X-Correlation-ID
+          generator: uuid
+          echo_downstream: true
+
+# Edge metrics for the whole gateway (status codes, latency, rate-limit hits), per consumer.
+plugins:
+  - name: prometheus
+    config:
+      per_consumer: true
+      status_code_metrics: true
+      latency_metrics: true
+
+# One demo counterparty so the stack is curl-able out of the box. In a real deployment each bank
+# gets its own consumer + key, provisioned out of band and rotated. This key is NOT a secret.
+consumers:
+  - username: demo-bank
+    keyauth_credentials:
+      - key: demo-bank-key-please-rotate

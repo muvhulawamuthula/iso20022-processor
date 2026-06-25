@@ -57,10 +57,30 @@
             <version>4.0.5</version>
         </dependency>
 
+        <!-- H2 backs the default `local` profile (quick `mvn spring-boot:run`) and the test suite. -->
         <dependency>
             <groupId>com.h2database</groupId>
             <artifactId>h2</artifactId>
             <scope>runtime</scope>
+        </dependency>
+
+        <!-- Postgres backs the `postgres` profile that the container runs: a durable ledger and
+             idempotency store that survives a restart (an in-memory store would re-pay duplicates). -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- Flyway owns the Postgres schema. The unique constraint that makes idempotency correct
+             lives in version-controlled DDL, not Hibernate guesswork; Hibernate only validates. -->
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-database-postgresql</artifactId>
         </dependency>
 
         <dependency>

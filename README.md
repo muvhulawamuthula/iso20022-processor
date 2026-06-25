@@ -100,10 +100,55 @@ mvn test   # 16 tests: business rules, the double-entry invariant, full HTTP flo
 
 ### Run it in Docker
 
+The standalone image runs the default `local` profile (in-memory H2 — zero external dependencies):
+
 ```bash
 docker build -t iso20022-processor .
 docker run -p 8080:8080 iso20022-processor   # runs as a non-root user, with a healthcheck
 ```
+
+### Run the full stack — Kong gateway + Postgres
+
+`docker compose up` brings up the production-shaped topology: a counterparty talks **only** to Kong,
+which fronts the settlement engine, which persists to Postgres.
+
+```
+counterparty ──▶ kong :8000 ──▶ app :8080 ──▶ postgres :5432
+                 (authn, rate-limit,         (durable ledger +
+                  size cap, correlation)      idempotency store)
+```
+
+```bash
+docker compose up --build
+```
+
+The app is **not** published to the host — the settlement engine is never directly reachable. The
+only way in is Kong on `:8000`, which enforces edge policy declaratively (`kong/kong.yml`):
+
+- **key-auth** — every submission must present a counterparty API key (no anonymous clearing).
+- **rate-limiting** — 60 req/min, budgeted *per consumer* so one bank can't starve the others.
+- **request-size-limiting** — 512 KB body cap, rejected at the edge (defense in depth with the
+  app's XXE hardening).
+- **correlation-id** — stamps `X-Correlation-ID`, pairing with the app's `MsgId` MDC trace.
+
+Submit through the gateway with the demo counterparty's key:
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/payments/pacs008 \
+  -H "Content-Type: application/xml" \
+  -H "apikey: demo-bank-key-please-rotate" \
+  --data-binary @src/main/resources/samples/valid-pacs008.xml
+```
+
+Omit the key and Kong returns `401` before the request ever reaches the app. Because Postgres uses a
+named volume, the ledger and answered-`MsgId` set **survive a restart** — bounce the stack and a
+redelivered pacs.008 still replays its stored response instead of paying twice. Edge metrics
+(per-consumer status codes, latency, rate-limit hits) are at `http://localhost:8100/metrics`.
+
+The Postgres schema is owned by **Flyway** (`src/main/resources/db/migration`), not Hibernate: the
+unique constraint that makes idempotency correct lives in version-controlled DDL, and Hibernate runs
+`validate`-only against it (failing fast on any drift between the migration and the `@Entity`
+mappings). Inspect the ledger directly on the host at `localhost:5433` (db/user/pass `payments`).
 
 ### Observability
 
@@ -197,18 +242,21 @@ This is a portfolio-scale build. To run in a real clearing context you would add
   dead-letter queue, poison-message handling, and the same idempotent consumer logic. (This is
   the companion "IBM MQ Integration Gateway" project.)
 - **Real account/balance checks** — `AC04` closed account, insufficient-funds, limit checks.
-- **Persistent idempotency store** (the in-memory H2 table resets on restart) and a retention
-  policy. The Dockerfile and config are ready to point at Postgres.
+- **Idempotency-store retention policy** — the durable Postgres `processed_message` table grows
+  unbounded; a real deployment ages out or archives answered `MsgId`s on a settlement-window TTL.
 - **Distributed tracing** — the metrics and MDC correlation are wired here; OpenTelemetry spans
   per message across the MQ → settle → acknowledge hops are the next step.
 
 Done already, and often listed as "what's next" elsewhere: **multi-transaction batches with
-per-transaction status**, **partial-batch settlement**, **Prometheus metrics**, **CI**, and a
-**non-root container**.
+per-transaction status**, **partial-batch settlement**, a **durable Postgres ledger +
+idempotency store** (Flyway-managed, idempotency enforced by a DB unique constraint), an
+**API-gateway edge** (Kong: key-auth, per-consumer rate limiting, size cap, correlation IDs),
+**Prometheus metrics**, **CI**, and a **non-root container**.
 
 ---
 
 ## Stack
 
 Java 21 · Spring Boot 3.3 · Spring Data JPA · JAXB (jakarta) · JAXP (XSD + XSLT) ·
-Micrometer / Prometheus · H2 · JUnit 5 + MockMvc · Docker · GitHub Actions
+Micrometer / Prometheus · H2 / Postgres · Flyway · Kong API gateway ·
+JUnit 5 + MockMvc · Docker / Docker Compose · GitHub Actions

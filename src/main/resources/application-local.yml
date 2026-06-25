@@ -1,0 +1,17 @@
+# Default profile: in-memory H2. Zero external dependencies, so `mvn spring-boot:run` and the
+# whole test suite run as-is. The ledger and idempotency store are NOT durable here — that is the
+# point of the `postgres` profile. Flyway is off; Hibernate manages the schema for convenience.
+spring:
+  datasource:
+    url: jdbc:h2:mem:ledger;DB_CLOSE_DELAY=-1
+    username: sa
+    password: ""
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: false
+  flyway:
+    enabled: false
+  h2:
+    console:
+      enabled: true   # http://localhost:8080/h2-console  (JDBC URL: jdbc:h2:mem:ledger)
