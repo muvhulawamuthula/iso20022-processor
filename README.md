@@ -9,9 +9,10 @@ validated and settled independently and reported with its own status, so a singl
 back **fully accepted (ACSC)**, **fully rejected (RJCT)**, or **partially accepted (PART)** — the
 mix real clearing systems actually produce.
 
-This is the kind of component that sits at the heart of a national payments or interbank
-clearing system. It is deliberately built to demonstrate **payments-engineering judgment** —
-not just "it works", but *why each decision is the safe one when real money moves*.
+It models the kind of component that sits at the heart of a national payments or interbank
+clearing system, with the correctness properties that matter when real money moves: idempotent
+processing, atomic settlement, a balanced double-entry ledger, and structured ISO status
+responses on every outcome.
 
 ---
 
@@ -54,9 +55,8 @@ not just "it works", but *why each decision is the safe one when real money move
  └─────────────────────────────────────────────┘
 ```
 
-Spec requirements this single project demonstrates: **XSD validation, XSLT transformation,
-XML processing, ISO 20022 message standards, and payment-domain logic** — the five things
-that move a CV from "general Java dev" to "payments engineer".
+The pipeline exercises the full ISO 20022 toolchain: **XSD validation, XSLT transformation,
+XML processing, the message standards themselves, and payment-domain logic.**
 
 ---
 
@@ -172,7 +172,7 @@ line for a message also carries its `MsgId` (via MDC) so a single payment is tra
 
 ---
 
-## Design decisions (the part interviewers actually probe)
+## Design decisions
 
 **1. Schema validation and business validation are separate layers — on purpose.**
 A schema-valid message can still be a financially invalid instruction (a perfectly well-formed
@@ -230,9 +230,9 @@ XML/JAXB types stop at `Pacs008Parser`. Everything downstream works with the pla
 
 ---
 
-## Production hardening (the honest "what's next")
+## Production hardening
 
-This is a portfolio-scale build. To run in a real clearing context you would add:
+Running this in a real clearing context would add:
 
 - **Official ISO 20022 schemas.** The bundled `pacs.008.001.08.xsd` is a faithful, valid
   *subset* so the project runs out of the box. Drop the official schema from
@@ -247,7 +247,7 @@ This is a portfolio-scale build. To run in a real clearing context you would add
 - **Distributed tracing** — the metrics and MDC correlation are wired here; OpenTelemetry spans
   per message across the MQ → settle → acknowledge hops are the next step.
 
-Done already, and often listed as "what's next" elsewhere: **multi-transaction batches with
+Already implemented: **multi-transaction batches with
 per-transaction status**, **partial-batch settlement**, a **durable Postgres ledger +
 idempotency store** (Flyway-managed, idempotency enforced by a DB unique constraint), an
 **API-gateway edge** (Kong: key-auth, per-consumer rate limiting, size cap, correlation IDs),
