@@ -17,7 +17,7 @@ responses on every outcome.
 <details>
 <summary>📸 Rendered README preview</summary>
 
-![Rendered README rendered on GitHub](docs/readme-rendered.png)
+![Rendered README on GitHub](docs/readme-rendered.png)
 
 </details>
 
