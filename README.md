@@ -142,3 +142,7 @@ A real clearing deployment would still add:
 Java 21 · Spring Boot 3.3 · Spring Data JPA · JAXB (jakarta) · JAXP (XSD + XSLT) ·
 Micrometer / Prometheus · H2 / Postgres · Flyway · Kong API gateway ·
 JUnit 5 + MockMvc · Docker / Docker Compose · GitHub Actions
+
+## License
+
+MIT. See [LICENSE](LICENSE).
